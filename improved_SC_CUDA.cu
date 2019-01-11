@@ -1,5 +1,3 @@
-
-
 #include <fstream>
 #include <iostream>
 #include <math.h>
@@ -69,12 +67,12 @@ __global__ void precessnucspins(float *i, float *a, float *s, const int ni, floa
 
 //----------------------------------------------------------------------------- 
 
-__global__ void setup_rand(curandState *state, unsigned long seed)
+__global__ void setup_rand(curandState *state, unsigned long seed, const int mcs)
 {
-    int ggid = (blockIdx.x * blockDim.x) + threadIdx.x;
+    unsigned ggid = (blockIdx.x * blockDim.x) + threadIdx.x;
     /* Each thread gets same seed, a different sequence 
        number, no offset */
-    curand_init(seed, ggid<<18, 0, &state[ggid]);
+    curand_init(seed, ggid, 4*mcs*ggid, &state[ggid]);
 }
 
 //----------------------------------------------------------------------------- 
@@ -114,19 +112,21 @@ __global__ void vecbuildi(float *i, curandState *state, const int ni, const int 
     int glid = threadIdx.x;
     int glid1 = threadIdx.y;
     int groupid = blockIdx.x;
+    int ng = nl*gridDim.x; 
     float m = 0;
     if (ggid < nindium){ 
         m = sqrt(99.0f/4.0f);
     } else {
         m = sqrt(15.0f/4.0f);
     }
-    float v = curand_uniform(&state[ggid]);
+    float v = curand_uniform(&state[ggid + ggid1*ng]);
     float phi = 2.0f*M_PI*v;
-    float g = curand_uniform(&state[ggid]);
+    float g = curand_uniform(&state[ggid + ggid1*ng]);
     float th = acos(2.0f*g - 1.0f);
     iloc[3*glid + 3*nl*glid1] = m*sin(th)*cos(phi);
     iloc[3*glid + 3*nl*glid1 + 1] = m*sin(th)*sin(phi);
     iloc[3*glid + 3*nl*glid1 + 2] = m*cos(th);
+    __syncthreads();
     int wind = 3*nl*groupid + glid;
     for(int ii = 0; ii < 3 && wind < 3*ni; ++ii, wind += nl)
     {
@@ -352,9 +352,9 @@ int main(void)
                2.0*prop.memoryClockRate*(prop.memoryBusWidth/8)/1.0e6);
     }
 
-    int ni = 61880;
+    int ni = 60469;
     
-    int nindium = 30544;
+    int nindium = 30588;
     
     
     
@@ -362,7 +362,7 @@ int main(void)
     int local_size2 = 16;
     
     int global_blocks1 = (ni + local_size1 - 1)/local_size1;
-    int global_blocks2 = 64;
+    int global_blocks2 = 640;
     
     int global_size1 = global_blocks1*local_size1;
     int global_size2 = global_blocks2*local_size2;
@@ -379,7 +379,7 @@ int main(void)
     
     // Set up maxtime
     
-    float tmax = 352.0;
+    float tmax = 350.0;
     
     // xmax - total number of timesteps
     
@@ -387,7 +387,7 @@ int main(void)
     
     // xmax must be a multiple of iterations
     
-    int iterations = 100;
+    int iterations = 50;
     
     int size = xmax/iterations;
     
@@ -401,7 +401,7 @@ int main(void)
     
     // Set up monte carlo iterations
     
-    int mcs = 10;
+    int mcs = 100;
     
     // Set up 2D workgroups
     
@@ -420,7 +420,7 @@ int main(void)
     
     wi[0] = 0.0;
     wi[1] = 0.0;
-    wi[2] = 0.4204989275887444;
+    wi[2] = 0.0;
     
     
     
@@ -434,21 +434,9 @@ int main(void)
     // Set up state for random number generation
     curandState *state;
     
-    int randblocks = 0;
-    int randloc = 0;
+
+    cudaMallocManaged((void**)&state, global_size1*global_size2*sizeof(curandState));
     
-    if (global_size1 >= global_size2){
-        randblocks = global_blocks1;
-        randloc = local_size1;
-        cudaMallocManaged((void**)&state, global_size1*sizeof(curandState));
-    } else {
-        randblocks = global_blocks2;
-        randloc = local_size2;
-        cudaMallocManaged((void**)&state, global_size2*sizeof(curandState));
-    }
-    
-    
-  
     
     // Set up the hyperfine constants
     float *hyperfine;
@@ -457,7 +445,7 @@ int main(void)
     
     std::ifstream hyp;
     
-    hyp.open("hyp1.txt");
+    hyp.open("hyp.txt");
     
     int p = 0;
     for(std::string line; std::getline(hyp, line); )
@@ -524,7 +512,7 @@ int main(void)
 
 
     // Call random number generation setup kernel
-    setup_rand<<<randblocks, randloc>>>(state,seed);
+    setup_rand<<<global_blocks1*global_blocks2, local_size1*local_size2>>>(state,seed,mcs);
     
     for (int u = 0; u < mcs; ++u)
     {
