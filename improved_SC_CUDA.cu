@@ -5,6 +5,7 @@
 #include <curand_kernel.h>
 #include <cuda.h>
 #include <string>
+#include <time.h>
 
 __device__ void rot( float *w, float *vec, float dt)
 {
@@ -46,17 +47,24 @@ __global__ void precessnucspins(float *i, float *a, float *s, const int ni, floa
     int groupid = blockIdx.x;
     int nl = blockDim.x;
     float w[3];
-    float store = a[ggid];
-    w[0] = store*s[3*ggid1];
-    w[1] = store*s[1 + 3*ggid1];
-    w[2] = store*s[2 + 3*ggid1];
-    
+    float store = 0;
     int sind = 3*nl*groupid + glid;
     for(int ii = 0; ii < 3 && sind < 3*ni; ++ii, sind += nl)
     {
         iloc[glid + ii*nl + 3*nl*glid1] = i[sind + 3*ni*ggid1];
     }
-    rot (w, iloc+(3*glid+3*nl*glid1), dt[0]/2);
+    __syncthreads();
+    if (ggid < ni)
+    {
+        store = a[ggid];
+     
+        w[0] = store*s[3*ggid1];
+        w[1] = store*s[1 + 3*ggid1];
+        w[2] = store*s[2 + 3*ggid1];
+
+        rot (w, iloc+(3*glid+3*nl*glid1), dt[0]/2);
+    }
+    __syncthreads();
     int wind = 3*nl*groupid + glid;
     for(int ii = 0; ii < 3 && wind < 3*ni; ++ii, wind += nl)
     {
@@ -152,7 +160,10 @@ const int ni)
     store[glid] = 1;
     if (a == ng) 
     {
-        store[glid] = hyp[ggid];
+        if (ggid < ni)
+        {
+            store[glid] = hyp[ggid];
+        }
         int sind = 3*nl*groupid + glid;
         for(int ii = 0; ii < 3 && sind < 3*ni; ++ii, sind += nl)
         {
@@ -182,12 +193,24 @@ const int ni)
         w[(ggid >> n)*3 + 1 + 3*ng*ggid1] = wtemp[1 + 3*nl*glid1] + wtemp[4 + 3*nl*glid1];
         w[(ggid >> n)*3 + 2 + 3*ng*ggid1] = wtemp[2 + 3*nl*glid1] + wtemp[5 + 3*nl*glid1];
     }
-    int e = a%nl;
-    int c = (a - e)/nl + e;
-    int wind = 3*nl*groupid + glid + 3*c;
-    for (int ii = 0; ii < 3 && wind < 3*ng; ++ii, wind += nl)
+    int c = 0;
+    if (a%nl == 0)
     {
-        w[wind + 3*ng*ggid1] = 0;
+        c = a/nl;
+    }
+    else
+    {
+        c = a/nl + 1;
+    }
+    __syncthreads();
+
+    int wind = 3*nl*groupid + glid;
+    for(int ii = 0; ii < 3; ++ii, wind += nl)
+    {
+        if (wind >= 3*c)
+        {
+            w[wind + 3*ng*ggid1] = 0;
+        }
     }
 }
 
@@ -209,6 +232,7 @@ float *sstore, const int a, float *dt)
     {
         sloc[glid + ii*nl] = s[sind];
     }
+    __syncthreads();
     wloc[3*glid] = w[3*a*ggid];
     wloc[3*glid + 1] = w[3*a*ggid + 1];
     wloc[3*glid + 2] = w[3*a*ggid + 2];
@@ -219,6 +243,7 @@ float *sstore, const int a, float *dt)
     wtemp[1] = wloc[1 + 3*glid] + wi[1];
     wtemp[2] = wloc[2 + 3*glid] + wi[2];
     rot (wtemp, sloc+(3*glid), dt[0]);
+    __syncthreads();
     int wind = 3*nl*groupid + glid;
     for(int ii = 0; ii < 3; ++ii, wind += nl)
     {
@@ -247,11 +272,13 @@ __global__ void prep2(float *sstore, float *output, const int size, float *sinit
     {
         sstoreloc[glid + ii*nl + 3*nl*glid1] = sstore[sind + 3*size*ggid1];
     }
+    __syncthreads();
     outputloc[glid*3 + 3*nl*glid1] = store[0]*sstoreloc[glid*3 + 3*nl*glid1];
     outputloc[glid*3 + 3*nl*glid1 + 1] = store[0]*sstoreloc[glid*3 + 3*nl*glid1 + 1];
     outputloc[glid*3 + 3*nl*glid1 + 2] = store[1]*sstoreloc[glid*3 + 3*nl*glid1 + 2];
+    __syncthreads();
     int wind = 3*nl*groupid + glid;
-    for(int ii = 0; ii < 3 && wind < 3*size; ++ii, wind += nl)
+    for(int ii = 0; ii < 3; ++ii, wind += nl)
     {
         output[wind + 3*ng*ggid1] = outputloc[glid + 3*nl*glid1 + ii*nl];
     }
@@ -292,8 +319,16 @@ __global__ void reduce2(const int n, const int a, float *output)
         output[sind + nl + 3*ng*(ggid1 >> n)] = sstoretemp[glid + nl] + sstoretemp[glid + nl + 3*nl];
         output[sind + 2*nl + 3*ng*(ggid1 >> n)] = sstoretemp[glid + 2*nl] + sstoretemp[glid + 2*nl + 3*nl];
     }
-    int e = a%nl1;
-    int c = (a - e)/nl1 + e - 1;
+    int c = 0;
+    if (a%nl1 == 0)
+    {
+        c = a/nl1;
+    }
+    else
+    {
+        c = a/nl1 + 1;
+    }
+    __syncthreads();
     if (ggid1 > c) 
     {
         for (int ii = 0; ii < 3 && sind < 3*ng; ++ii, sind += nl)
@@ -338,6 +373,10 @@ int main(void)
 
     int nDevices;
 
+    clock_t t;
+
+    t = clock();
+
     cudaGetDeviceCount(&nDevices);
     for (int i = 0; i < nDevices; i++) {
       cudaDeviceProp prop;
@@ -358,11 +397,11 @@ int main(void)
     
     
     
-    int local_size1 = 32;
-    int local_size2 = 16;
+    int local_size1 = 256;
+    int local_size2 = 2;
     
     int global_blocks1 = (ni + local_size1 - 1)/local_size1;
-    int global_blocks2 = 640;
+    int global_blocks2 = 8;
     
     int global_size1 = global_blocks1*local_size1;
     int global_size2 = global_blocks2*local_size2;
@@ -387,7 +426,7 @@ int main(void)
     
     // xmax must be a multiple of iterations
     
-    int iterations = 50;
+    int iterations = 100;
     
     int size = xmax/iterations;
     
@@ -401,7 +440,7 @@ int main(void)
     
     // Set up monte carlo iterations
     
-    int mcs = 100;
+    int mcs = 64;
     
     // Set up 2D workgroups
     
@@ -420,7 +459,7 @@ int main(void)
     
     wi[0] = 0.0;
     wi[1] = 0.0;
-    wi[2] = 0.0;
+    wi[2] = 4.0*0.10678276604819256;
     
     
     
@@ -505,8 +544,7 @@ int main(void)
     
     // Set up seed for random number generation
     unsigned long seed = 1234; 
-    
-    
+        
     //----------------------------------------------------------------------------- 
     // Kernel Calls
 
@@ -543,8 +581,18 @@ int main(void)
                 while (a>1)
                 {
                     reduce<<<gridSize, blockSize, (local_size1 + 3*local_size1*local_size2)*sizeof(float)>>>(i, w, n1, a, hyperfine, ni);
-                    a = a/local_size1;
+                    
+                    if (a%local_size1 == 0)
+                    {
+                        a = a/local_size1;
+                    }
+                    else
+                    {
+                        a = a/local_size1 + 1;
+                    }
                 }
+
+                
                 
                 
                 precesselecspins<<<global_blocks2,local_size2,2*3*local_size2*sizeof(float)>>>(w, wi, s, size, x, sstore, global_size1, dt);
@@ -565,7 +613,14 @@ int main(void)
             while (b>1)
             {
                 reduce2<<<gridSizetensors, blockSize, 3*local_size1*local_size2*sizeof(float)>>>(n2, b, output);
-                b = b/local_size2;
+                if (b%local_size2 == 0)
+                {
+                    b = b/local_size2;
+                }
+                else
+                {
+                    b = b/local_size2 + 1;
+                }
             }
             
             // Sum Rxx, Rxy, Rzz over different monte carlo step iterations - note that this is
@@ -582,24 +637,28 @@ int main(void)
     final<<<global_blocks_final, local_size1>>>(Rxx, Rxy, Rzz, h, xmax);
     
     cudaDeviceSynchronize();
+
+    t = clock() - t;
+
+    std::cout << "Time: " << t << std::endl;
     
     float time = 0;
     
     std::ofstream Rxxtxt;
     
-    Rxxtxt.open("Rxx.txt");
+    Rxxtxt.open("Rxx_w=4*delB.txt");
     
     for (int j = 0; j<xmax; ++j)
     {
         Rxxtxt << time << " " << Rxx[j] << "\n";
         time += dt[0];
-        std::cout << time << " " << Rxx[j] << std::endl;
+        //std::cout << time << " " << Rxx[j] << std::endl;
     }
     Rxxtxt.close();
     
     std::ofstream Rxytxt;
     
-    Rxytxt.open("Rxy.txt");
+    Rxytxt.open("Rxy_w=4*delB.txt");
     
     time = 0;
     
@@ -607,13 +666,13 @@ int main(void)
     {
         Rxytxt << time << " " << Rxy[j] << "\n";
         time += dt[0];
-        std::cout << time << " " << Rxy[j] << std::endl;
+        //std::cout << time << " " << Rxy[j] << std::endl;
     }
     Rxytxt.close();
     
     std::ofstream Rzztxt;
     
-    Rzztxt.open("Rzz.txt");
+    Rzztxt.open("Rzz_w=4*delB.txt");
     
     time = 0;
     
@@ -621,7 +680,7 @@ int main(void)
     {
         Rzztxt << time << " " << Rzz[j] << "\n";
         time += dt[0];
-        std::cout << time << " " << Rzz[j] << std::endl;
+        //std::cout << time << " " << Rzz[j] << std::endl;
     }
     Rzztxt.close();
     
@@ -642,3 +701,5 @@ int main(void)
     
     
 }
+
+
