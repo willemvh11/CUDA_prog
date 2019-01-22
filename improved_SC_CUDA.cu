@@ -145,7 +145,7 @@ __global__ void vecbuildi(float *i, curandState *state, const int ni, const int 
 //----------------------------------------------------------------------------- 
 
 __global__ void reduce(float *i, float *w, const int n, const int a, float *hyp, 
-const int ni)
+const int ni, float *wout, const int count, const int size)
 {
     extern __shared__ float locmem[];
     float* store = locmem;
@@ -157,8 +157,7 @@ const int ni)
     int nl = blockDim.x;
     int ng = nl*gridDim.x;
     int groupid = blockIdx.x;
-    store[glid] = 1;
-    if (a == ng) 
+    if (count == 0) 
     {
         if (ggid < ni)
         {
@@ -169,11 +168,17 @@ const int ni)
         {
             w[sind + 3*ng*ggid1] = i[sind + 3*ni*ggid1];
         }
+        __syncthreads();
+
+        wtemp[glid + 3*nl*glid1] = store[(glid - glid%3)/3]*w[3*nl*groupid + glid + 3*ng*ggid1];
+        wtemp[glid + nl + 3*nl*glid1] = store[(glid + nl - (glid + nl)%3)/3]*w[3*nl*groupid + glid + nl + 3*ng*ggid1];
+        wtemp[glid + 2*nl + 3*nl*glid1] = store[(glid + 2*nl - (glid + 2*nl)%3)/3]*w[3*nl*groupid + glid + 2*nl + 3*ng*ggid1];
+    
+    } else {
+        wtemp[glid + 3*nl*glid1] = w[3*nl*groupid + glid + 3*ng*ggid1];
+        wtemp[glid + nl + 3*nl*glid1] = w[3*nl*groupid + glid + nl + 3*ng*ggid1];
+        wtemp[glid + 2*nl + 3*nl*glid1] = w[3*nl*groupid + glid + 2*nl + 3*ng*ggid1];
     }
-    __syncthreads();
-    wtemp[glid + 3*nl*glid1] = store[(glid - glid%3)/3]*w[3*nl*groupid + glid + 3*ng*ggid1];
-    wtemp[glid + nl + 3*nl*glid1] = store[(glid + nl - (glid + nl)%3)/3]*w[3*nl*groupid + glid + nl + 3*ng*ggid1];
-    wtemp[glid + 2*nl + 3*nl*glid1] = store[(glid + 2*nl - (glid + 2*nl)%3)/3]*w[3*nl*groupid + glid + 2*nl + 3*ng*ggid1];
     #pragma unroll
     for (int k=1; k < n; k++)
     {
@@ -187,12 +192,13 @@ const int ni)
         }
     }
     __syncthreads();
+    
     if (glid == 0) 
     {
-        w[(ggid >> n)*3+ 3*ng*ggid1] = wtemp[3*nl*glid1] + wtemp[3 + 3*nl*glid1];
-        w[(ggid >> n)*3 + 1 + 3*ng*ggid1] = wtemp[1 + 3*nl*glid1] + wtemp[4 + 3*nl*glid1];
-        w[(ggid >> n)*3 + 2 + 3*ng*ggid1] = wtemp[2 + 3*nl*glid1] + wtemp[5 + 3*nl*glid1];
-    }
+        wout[(ggid >> n)*3 + 3*size*ggid1] = wtemp[3*nl*glid1] + wtemp[3 + 3*nl*glid1];
+        wout[(ggid >> n)*3 + 1 + 3*size*ggid1] = wtemp[1 + 3*nl*glid1] + wtemp[4 + 3*nl*glid1];
+        wout[(ggid >> n)*3 + 2 + 3*size*ggid1] = wtemp[2 + 3*nl*glid1] + wtemp[5 + 3*nl*glid1];
+    }    
     int c = 0;
     if (a%nl == 0)
     {
@@ -203,13 +209,13 @@ const int ni)
         c = a/nl + 1;
     }
     __syncthreads();
-
+    
     int wind = 3*nl*groupid + glid;
-    for(int ii = 0; ii < 3; ++ii, wind += nl)
+    for(int ii = 0; ii < 3 && wind < 3*size; ++ii, wind += nl)
     {
         if (wind >= 3*c)
-        {
-            w[wind + 3*ng*ggid1] = 0;
+        {   
+            wout[wind + 3*size*ggid1] = 0;
         }
     }
 }
@@ -437,6 +443,14 @@ int main(void)
     int global_sizetensors = global_blocks_tensors * local_size1;
     
     dim3 gridSizetensors = dim3 (global_blocks_tensors, global_blocks2);
+
+    // Global size for odd reductions
+
+    int global_blocks_odd = (global_blocks1 + local_size1 - 1)/local_size1;
+
+    int global_size_odd = global_blocks_odd*local_size1;
+
+    dim3 gridSizeodd = dim3 (global_blocks_odd, global_blocks2);
     
     // Set up monte carlo iterations
     
@@ -520,6 +534,12 @@ int main(void)
     float *w;
     
     cudaMallocManaged(&w, 3*global_size1*global_size2*sizeof(float));
+
+    // Set up output of omega vector
+
+    float *wout;
+
+    cudaMallocManaged(&wout, 3*global_size_odd*global_size2*sizeof(float));
     
     // Set up tensor vectors
     float *Rxx, *Rxy, *Rzz;
@@ -544,6 +564,8 @@ int main(void)
     
     // Set up seed for random number generation
     unsigned long seed = 1234; 
+
+    int pmax = 0;
         
     //----------------------------------------------------------------------------- 
     // Kernel Calls
@@ -575,27 +597,34 @@ int main(void)
                 
     
 
-                
+                int p = 0;
                 int a = global_size1;
                 
                 while (a>1)
                 {
-                    reduce<<<gridSize, blockSize, (local_size1 + 3*local_size1*local_size2)*sizeof(float)>>>(i, w, n1, a, hyperfine, ni);
+                    if (p%2 == 0)
+                    {
+                        reduce<<<gridSize, blockSize, (local_size1 + 3*local_size1*local_size2)*sizeof(float)>>>(i, w, n1, a, hyperfine, ni, wout, p, global_size_odd);
+                    } else{
+                        reduce<<<gridSizeodd, blockSize, (local_size1 + 3*local_size1*local_size2)*sizeof(float)>>>(i, wout, n1, a, hyperfine, ni, w, p, global_size1);
+                    }
                     
                     if (a%local_size1 == 0)
                     {
                         a = a/local_size1;
-                    }
-                    else
-                    {
+                    } else {
                         a = a/local_size1 + 1;
                     }
+                    p = p + 1;
                 }
-
+                pmax = p;
                 
-                
-                
-                precesselecspins<<<global_blocks2,local_size2,2*3*local_size2*sizeof(float)>>>(w, wi, s, size, x, sstore, global_size1, dt);
+                if (pmax%2 == 0)
+                {
+                    precesselecspins<<<global_blocks2,local_size2,2*3*local_size2*sizeof(float)>>>(w, wi, s, size, x, sstore, global_size1, dt);
+                } else {
+                    precesselecspins<<<global_blocks2,local_size2,2*3*local_size2*sizeof(float)>>>(wout, wi, s, size, x, sstore, global_size_odd, dt);
+                }
                 
                 
                 precessnucspins<<<gridSize, blockSize, 3*local_size1*local_size2*sizeof(float)>>>(i, hyperfine, s, ni, dt);
