@@ -292,7 +292,7 @@ __global__ void prep2(float *sstore, float *output, const int size, float *sinit
 
 //-----------------------------------------------------------------------------
 
-__global__ void reduce2(const int n, const int a, float *output)
+__global__ void reduce2(const int n, const int a, float *output, float *out)
 {
     extern __shared__ float sstoretemp[];
     int ggid1 = (blockIdx.y * blockDim.y) + threadIdx.y;
@@ -321,9 +321,9 @@ __global__ void reduce2(const int n, const int a, float *output)
     __syncthreads();
     if (glid1 == 0) 
     {
-        output[sind + 3*ng*(ggid1 >> n)] = sstoretemp[glid] + sstoretemp[glid + 3*nl];
-        output[sind + nl + 3*ng*(ggid1 >> n)] = sstoretemp[glid + nl] + sstoretemp[glid + nl + 3*nl];
-        output[sind + 2*nl + 3*ng*(ggid1 >> n)] = sstoretemp[glid + 2*nl] + sstoretemp[glid + 2*nl + 3*nl];
+        out[sind + 3*ng*(ggid1 >> n)] = sstoretemp[glid] + sstoretemp[glid + 3*nl];
+        out[sind + nl + 3*ng*(ggid1 >> n)] = sstoretemp[glid + nl] + sstoretemp[glid + nl + 3*nl];
+        out[sind + 2*nl + 3*ng*(ggid1 >> n)] = sstoretemp[glid + 2*nl] + sstoretemp[glid + 2*nl + 3*nl];
     }
     int c = 0;
     if (a%nl1 == 0)
@@ -339,7 +339,7 @@ __global__ void reduce2(const int n, const int a, float *output)
     {
         for (int ii = 0; ii < 3 && sind < 3*ng; ++ii, sind += nl)
         {
-            output[sind + 3*ng*ggid1] = 0;
+            out[sind + 3*ng*ggid1] = 0;
         }
     }
 }
@@ -557,6 +557,18 @@ int main(void)
     float *output;
     
     cudaMallocManaged(&output, 3*global_sizetensors*global_size2*sizeof(float));
+
+    // Set up out vector + block dim for 2nd reduction
+
+    int global_blocks_odd2 = (global_blocks2 + local_size2 - 1)/local_size2;
+
+    int global_size_odd2 = global_blocks_odd2*local_size2;
+
+    dim3 gridSizeodd2 = dim3 (global_blocks_tensors, global_blocks_odd2);
+
+    float *out;
+    
+    cudaMallocManaged(&out, 3*global_sizetensors*global_size_odd2*sizeof(float));
     
     // Work out logs
     int n1 = log2f(local_size1);
@@ -592,7 +604,7 @@ int main(void)
             for (int x = 0; x < size; ++x)
             {
                 // Precess the nuclear spins
-                precessnucspins<<<gridSize, blockSize, 3*local_size1*local_size2*sizeof(float)>>>(i, hyperfine, s, ni, dt);
+                //precessnucspins<<<gridSize, blockSize, 3*local_size1*local_size2*sizeof(float)>>>(i, hyperfine, s, ni, dt);
                 
                 
     
@@ -627,7 +639,7 @@ int main(void)
                 }
                 
                 
-                precessnucspins<<<gridSize, blockSize, 3*local_size1*local_size2*sizeof(float)>>>(i, hyperfine, s, ni, dt);
+                //precessnucspins<<<gridSize, blockSize, 3*local_size1*local_size2*sizeof(float)>>>(i, hyperfine, s, ni, dt);
             }
             
             // Prepare sstore for Rxx, Rxy, Rzz calculation
@@ -635,13 +647,19 @@ int main(void)
             
             // Reset b between each monte carlo step
             int b = global_size2;
-            
+            int g = 0;
             // Reduction in the y direction (over different monte carlo steps running in parallel)
             // note that global size in the x direction is now related to xmax (no longer ni)
             
             while (b>1)
             {
-                reduce2<<<gridSizetensors, blockSize, 3*local_size1*local_size2*sizeof(float)>>>(n2, b, output);
+                if (g%2 == 0)
+                {
+                    reduce2<<<gridSizetensors, blockSize, 3*local_size1*local_size2*sizeof(float)>>>(n2, b, output, out);
+                } else {
+                    reduce2<<<gridSizeodd2, blockSize, 3*local_size1*local_size2*sizeof(float)>>>(n2, b, out, output);
+                }
+                
                 if (b%local_size2 == 0)
                 {
                     b = b/local_size2;
@@ -650,12 +668,18 @@ int main(void)
                 {
                     b = b/local_size2 + 1;
                 }
+                g = g + 1;
             }
             
             // Sum Rxx, Rxy, Rzz over different monte carlo step iterations - note that this is
             // now a 1D workgroup size
+            if (g%2 ==0)
+            {
+                tensors<<<global_blocks_tensors, local_size1>>>(output, Rxx, Rxy, Rzz, size, j);
+            } else {
+                tensors<<<global_blocks_tensors, local_size1>>>(out, Rxx, Rxy, Rzz, size, j);
+            }
             
-            tensors<<<global_blocks_tensors, local_size1>>>(output, Rxx, Rxy, Rzz, size, j);
         }
     }
     
