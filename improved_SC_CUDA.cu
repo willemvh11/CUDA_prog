@@ -7,7 +7,7 @@
 #include <string>
 #include <time.h>
 
-__device__ void rot( float *w, float *vec, float dt)
+__device__ void rot( float *w, float *vec, const float dt)
 {
     float mw = sqrt(w[0]*w[0] + w[1]*w[1] + w[2]*w[2]);
     float omega[3];
@@ -37,7 +37,7 @@ __device__ void rot( float *w, float *vec, float dt)
 
 //-----------------------------------------------------------------------------
 
-__global__ void precessnucspins(float *i, float *a, float *s, const int ni, float *dt)
+__global__ void precessnucspins(float *i, float *a, float *s, const int ni, const float *dt)
 {
     extern __shared__ float iloc[];
     int ggid = (blockIdx.x * blockDim.x) + threadIdx.x;
@@ -223,7 +223,7 @@ const int ni, float *wout, const int count, const int size)
 //----------------------------------------------------------------------------- 
 
 __global__ void precesselecspins(float *w, float *wi, float *s, const int size, const int x, 
-float *sstore, const int a, float *dt)
+float *sstore, const int a, const float *dt)
 {
     extern __shared__ float locmem[];
     float* sloc = locmem;
@@ -303,6 +303,7 @@ __global__ void reduce2(const int n, const int a, float *output, float *out)
     int ng = nl*gridDim.x;
     int groupid = blockIdx.x;
     int sind = 3*nl*groupid + glid;
+    
     sstoretemp[glid + 3*nl*glid1] = output[sind + 3*ng*ggid1];
     sstoretemp[glid + 3*nl*glid1 + nl] = output[sind + 3*ng*ggid1 + nl];
     sstoretemp[glid + 3*nl*glid1 + 2*nl] = output[sind + 3*ng*ggid1 + 2*nl];
@@ -334,7 +335,6 @@ __global__ void reduce2(const int n, const int a, float *output, float *out)
     {
         c = a/nl1 + 1;
     }
-    __syncthreads();
     if (ggid1 > c) 
     {
         for (int ii = 0; ii < 3 && sind < 3*ng; ++ii, sind += nl)
@@ -349,12 +349,16 @@ __global__ void reduce2(const int n, const int a, float *output, float *out)
 __global__ void tensors(float *output, float *Rxx, float *Rxy, float *Rzz, const int size, const int j)
 {
      int ggid = (blockIdx.x * blockDim.x) + threadIdx.x;
+     
      if (ggid < size) 
      {
+        
         Rxx[ggid + j*size] = Rxx[ggid + j*size] + output[3*ggid];
         Rxy[ggid + j*size] = Rxy[ggid + j*size] + output[3*ggid + 1];
-        Rzz[ggid + j*size] = Rzz[ggid + j*size] + output[3*ggid + 2]; 
+        Rzz[ggid + j*size] = Rzz[ggid + j*size] + output[3*ggid + 2];
+        
      }
+     
 }
 
 //-----------------------------------------------------------------------------
@@ -397,17 +401,17 @@ int main(void)
                2.0*prop.memoryClockRate*(prop.memoryBusWidth/8)/1.0e6);
     }
 
-    int ni = 60469;
+    int ni = 1160;
     
-    int nindium = 30588;
+    int nindium = 553;
     
     
     
-    int local_size1 = 256;
-    int local_size2 = 2;
+    int local_size1 = 32;
+    int local_size2 = 32;
     
     int global_blocks1 = (ni + local_size1 - 1)/local_size1;
-    int global_blocks2 = 8;
+    int global_blocks2 = 3;
     
     int global_size1 = global_blocks1*local_size1;
     int global_size2 = global_blocks2*local_size2;
@@ -420,11 +424,11 @@ int main(void)
     
     cudaMallocManaged(&dt, 1*sizeof(float));
     
-    dt[0] = 0.1;
+    dt[0] = 1.0;
     
     // Set up maxtime
     
-    float tmax = 350.0;
+    float tmax = 100000.0;
     
     // xmax - total number of timesteps
     
@@ -454,7 +458,7 @@ int main(void)
     
     // Set up monte carlo iterations
     
-    int mcs = 64;
+    int mcs = 10;
     
     // Set up 2D workgroups
     
@@ -473,7 +477,7 @@ int main(void)
     
     wi[0] = 0.0;
     wi[1] = 0.0;
-    wi[2] = 4.0*0.10678276604819256;
+    wi[2] = 0.0;
     
     
     
@@ -558,17 +562,9 @@ int main(void)
     
     cudaMallocManaged(&output, 3*global_sizetensors*global_size2*sizeof(float));
 
-    // Set up out vector + block dim for 2nd reduction
-
-    int global_blocks_odd2 = (global_blocks2 + local_size2 - 1)/local_size2;
-
-    int global_size_odd2 = global_blocks_odd2*local_size2;
-
-    dim3 gridSizeodd2 = dim3 (global_blocks_tensors, global_blocks_odd2);
-
     float *out;
     
-    cudaMallocManaged(&out, 3*global_sizetensors*global_size_odd2*sizeof(float));
+    cudaMallocManaged(&out, 3*global_sizetensors*global_size2*sizeof(float));
     
     // Work out logs
     int n1 = log2f(local_size1);
@@ -581,8 +577,7 @@ int main(void)
         
     //----------------------------------------------------------------------------- 
     // Kernel Calls
-
-
+    
     // Call random number generation setup kernel
     setup_rand<<<global_blocks1*global_blocks2, local_size1*local_size2>>>(state,seed,mcs);
     
@@ -598,13 +593,16 @@ int main(void)
         
         // Build nuclear spin vector array
         vecbuildi<<<gridSize, blockSize, 3*local_size1*local_size2*sizeof(float)>>>(i, state, ni, nindium);
+
+        
         
         for (int j = 0; j < iterations; ++j)
         {
+            
             for (int x = 0; x < size; ++x)
             {
                 // Precess the nuclear spins
-                //precessnucspins<<<gridSize, blockSize, 3*local_size1*local_size2*sizeof(float)>>>(i, hyperfine, s, ni, dt);
+                precessnucspins<<<gridSize, blockSize, 3*local_size1*local_size2*sizeof(float)>>>(i, hyperfine, s, ni, dt);
                 
                 
     
@@ -630,6 +628,10 @@ int main(void)
                     p = p + 1;
                 }
                 pmax = p;
+
+                
+
+
                 
                 if (pmax%2 == 0)
                 {
@@ -639,7 +641,7 @@ int main(void)
                 }
                 
                 
-                //precessnucspins<<<gridSize, blockSize, 3*local_size1*local_size2*sizeof(float)>>>(i, hyperfine, s, ni, dt);
+                precessnucspins<<<gridSize, blockSize, 3*local_size1*local_size2*sizeof(float)>>>(i, hyperfine, s, ni, dt);
             }
             
             // Prepare sstore for Rxx, Rxy, Rzz calculation
@@ -653,11 +655,12 @@ int main(void)
             
             while (b>1)
             {
+
                 if (g%2 == 0)
                 {
                     reduce2<<<gridSizetensors, blockSize, 3*local_size1*local_size2*sizeof(float)>>>(n2, b, output, out);
                 } else {
-                    reduce2<<<gridSizeodd2, blockSize, 3*local_size1*local_size2*sizeof(float)>>>(n2, b, out, output);
+                    reduce2<<<gridSizetensors, blockSize, 3*local_size1*local_size2*sizeof(float)>>>(n2, b, out, output);
                 }
                 
                 if (b%local_size2 == 0)
@@ -699,7 +702,7 @@ int main(void)
     
     std::ofstream Rxxtxt;
     
-    Rxxtxt.open("Rxx_w=4*delB.txt");
+    Rxxtxt.open("Rxx_w=0.txt");
     
     for (int j = 0; j<xmax; ++j)
     {
@@ -711,7 +714,7 @@ int main(void)
     
     std::ofstream Rxytxt;
     
-    Rxytxt.open("Rxy_w=4*delB.txt");
+    Rxytxt.open("Rxy_w=0.txt");
     
     time = 0;
     
@@ -725,7 +728,7 @@ int main(void)
     
     std::ofstream Rzztxt;
     
-    Rzztxt.open("Rzz_w=4*delB.txt");
+    Rzztxt.open("Rzz_w=0.txt");
     
     time = 0;
     
@@ -749,6 +752,8 @@ int main(void)
     cudaFree(sstore);
     cudaFree(output);
     cudaFree(wi);
+    cudaFree(out);
+    cudaFree(wout);
     return 0;
     
     
