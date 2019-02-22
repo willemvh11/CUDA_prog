@@ -7,6 +7,7 @@
 #include <string>
 #include <time.h>
 
+
 __device__ void rot( float *w, float *vec, const float dt)
 {
     float mw = sqrt(w[0]*w[0] + w[1]*w[1] + w[2]*w[2]);
@@ -37,7 +38,7 @@ __device__ void rot( float *w, float *vec, const float dt)
 
 //-----------------------------------------------------------------------------
 
-__global__ void precessnucspins(float *i, float *a, float *s, const int ni, const float *dt)
+__global__ void precessnucspins(float *i, float *a, float *s, const int ni, const float dt)
 {
     extern __shared__ float iloc[];
     int ggid = (blockIdx.x * blockDim.x) + threadIdx.x;
@@ -62,7 +63,7 @@ __global__ void precessnucspins(float *i, float *a, float *s, const int ni, cons
         w[1] = store*s[1 + 3*ggid1];
         w[2] = store*s[2 + 3*ggid1];
 
-        rot (w, iloc+(3*glid+3*nl*glid1), dt[0]/2);
+        rot (w, iloc+(3*glid+3*nl*glid1), dt);
     }
     __syncthreads();
     int wind = 3*nl*groupid + glid;
@@ -223,7 +224,7 @@ const int ni, float *wout, const int count, const int size)
 //----------------------------------------------------------------------------- 
 
 __global__ void precesselecspins(float *w, float *wi, float *s, const int size, const int x, 
-float *sstore, const int a, const float *dt)
+float *sstore, const int a, const float dt)
 {
     extern __shared__ float locmem[];
     float* sloc = locmem;
@@ -248,7 +249,7 @@ float *sstore, const int a, const float *dt)
     wtemp[0] = wloc[3*glid] + wi[0];
     wtemp[1] = wloc[1 + 3*glid] + wi[1];
     wtemp[2] = wloc[2 + 3*glid] + wi[2];
-    rot (wtemp, sloc+(3*glid), dt[0]);
+    rot (wtemp, sloc+(3*glid), dt);
     __syncthreads();
     int wind = 3*nl*groupid + glid;
     for(int ii = 0; ii < 3; ++ii, wind += nl)
@@ -377,6 +378,20 @@ __global__ void final(float *Rxx, float *Rxy, float *Rzz, const int mcs, const i
 
 //-----------------------------------------------------------------------------
 
+__global__ void final_temp(float *Rxx, float *Rxy, float *Rzz, const int mcs, const int xmax, float *Rxxtemp, float *Rxytemp, float *Rzztemp)
+{
+    int ggid = (blockIdx.x * blockDim.x) + threadIdx.x;
+    float recipmcs = 1.0f/mcs;
+    if (ggid < xmax)
+    {
+        Rxytemp[ggid] = 2.0f*Rxy[ggid]*recipmcs;
+        Rzztemp[ggid] = 2.0f*Rzz[ggid]*recipmcs;
+        Rxxtemp[ggid] = 2.0f*Rxx[ggid]*recipmcs;
+    }
+}
+
+//-----------------------------------------------------------------------------
+
 
 int main(void)
 {
@@ -384,6 +399,7 @@ int main(void)
     int nDevices;
 
     clock_t t;
+    
 
     t = clock();
 
@@ -411,7 +427,7 @@ int main(void)
     int local_size2 = 32;
     
     int global_blocks1 = (ni + local_size1 - 1)/local_size1;
-    int global_blocks2 = 3;
+    int global_blocks2 = 32;
     
     int global_size1 = global_blocks1*local_size1;
     int global_size2 = global_blocks2*local_size2;
@@ -420,23 +436,21 @@ int main(void)
     
     // Set up timestep
     
-    float *dt;
+    float dt = 1.0;
     
-    cudaMallocManaged(&dt, 1*sizeof(float));
     
-    dt[0] = 1.0;
     
     // Set up maxtime
     
-    float tmax = 100000.0;
+    float tmax = 3000.0;
     
     // xmax - total number of timesteps
     
-    int xmax = tmax/dt[0];
+    int xmax = tmax/dt;
     
     // xmax must be a multiple of iterations
     
-    int iterations = 100;
+    int iterations = 1;
     
     int size = xmax/iterations;
     
@@ -455,10 +469,14 @@ int main(void)
     int global_size_odd = global_blocks_odd*local_size1;
 
     dim3 gridSizeodd = dim3 (global_blocks_odd, global_blocks2);
+
+    // Global size for final step
+
+    int global_blocks_final = (xmax + local_size1 - 1)/local_size1;
     
     // Set up monte carlo iterations
     
-    int mcs = 10;
+    int mcs = 1;
     
     // Set up 2D workgroups
     
@@ -551,6 +569,12 @@ int main(void)
     cudaMallocManaged(&Rxx, xmax*sizeof(float));
     cudaMallocManaged(&Rxy, xmax*sizeof(float));
     cudaMallocManaged(&Rzz, xmax*sizeof(float));
+
+    float *Rxxtemp, *Rxytemp, *Rzztemp;
+    
+    cudaMallocManaged(&Rxxtemp, xmax*sizeof(float));
+    cudaMallocManaged(&Rxytemp, xmax*sizeof(float));
+    cudaMallocManaged(&Rzztemp, xmax*sizeof(float));
     
     // Set up electron spin storage vector
     float *sstore;
@@ -571,9 +595,11 @@ int main(void)
     int n2 = log2f(local_size2);
     
     // Set up seed for random number generation
-    unsigned long seed = 1234; 
+    unsigned long seed = 1; 
 
     int pmax = 0;
+
+    float time = 0;
         
     //----------------------------------------------------------------------------- 
     // Kernel Calls
@@ -594,19 +620,16 @@ int main(void)
         // Build nuclear spin vector array
         vecbuildi<<<gridSize, blockSize, 3*local_size1*local_size2*sizeof(float)>>>(i, state, ni, nindium);
 
-        
+        // Precess the nuclear spins by dt/2 initially
+
+        precessnucspins<<<gridSize, blockSize, 3*local_size1*local_size2*sizeof(float)>>>(i, hyperfine, s, ni, dt/2.0);
         
         for (int j = 0; j < iterations; ++j)
         {
             
             for (int x = 0; x < size; ++x)
             {
-                // Precess the nuclear spins
-                precessnucspins<<<gridSize, blockSize, 3*local_size1*local_size2*sizeof(float)>>>(i, hyperfine, s, ni, dt);
-                
-                
-    
-
+            
                 int p = 0;
                 int a = global_size1;
                 
@@ -684,22 +707,60 @@ int main(void)
             }
             
         }
+        /*
+        if (u%5 == 0 && u != 0)
+        {
+            final_temp<<<global_blocks_final, local_size1>>>(Rxx, Rxy, Rzz, u*global_size2, xmax, Rxxtemp, Rxytemp, Rzztemp);
+            cudaDeviceSynchronize();
+            if (u%2 == 0)
+            {
+                std::ofstream Rzztemp2txt;
+        
+                Rzztemp2txt.open("Rzz_w=0_93_temp2_1.txt");
+                
+                time = 0;
+                
+                for (int j = 0; j<xmax; ++j)
+                {
+                    Rzztemp2txt << time << " " << Rzztemp[j] << "\n";
+                    time += dt[0];
+                }
+                Rzztemp2txt.close();
+            } else {
+
+                std::ofstream Rzztemp1txt;
+        
+                Rzztemp1txt.open("Rzz_w=0_93_temp1_1.txt");
+                
+                time = 0;
+                
+                for (int j = 0; j<xmax; ++j)
+                {
+                    Rzztemp1txt << time << " " << Rzztemp[j] << "\n";
+                    time += dt[0];
+                }
+                Rzztemp1txt.close();
+            }
+        }
+        */
     }
     
     int h = mcs*global_size2;
     
-    int global_blocks_final = (xmax + local_size1 - 1)/local_size1;
+    
     
     final<<<global_blocks_final, local_size1>>>(Rxx, Rxy, Rzz, h, xmax);
     
     cudaDeviceSynchronize();
 
     t = clock() - t;
+    //auto end = std::chrono::high_resolution_clock::now();
 
+    //std::cout << "Time: " << std::chrono::duration_cast<std::chrono::microseconds>(end-start).count() << "us" << std::endl;
     std::cout << "Time: " << t << std::endl;
     
-    float time = 0;
     
+    /*
     std::ofstream Rxxtxt;
     
     Rxxtxt.open("Rxx_w=0.txt");
@@ -725,7 +786,7 @@ int main(void)
         //std::cout << time << " " << Rxy[j] << std::endl;
     }
     Rxytxt.close();
-    
+    */
     std::ofstream Rzztxt;
     
     Rzztxt.open("Rzz_w=0.txt");
@@ -735,10 +796,11 @@ int main(void)
     for (int j = 0; j<xmax; ++j)
     {
         Rzztxt << time << " " << Rzz[j] << "\n";
-        time += dt[0];
-        //std::cout << time << " " << Rzz[j] << std::endl;
+        time += dt;
+        std::cout << time << " " << Rzz[j] << std::endl;
     }
     Rzztxt.close();
+    
     
     cudaFree(s);
     cudaFree(sinit);
@@ -754,6 +816,9 @@ int main(void)
     cudaFree(wi);
     cudaFree(out);
     cudaFree(wout);
+    cudaFree(Rxxtemp);
+    cudaFree(Rxytemp);
+    cudaFree(Rzztemp);
     return 0;
     
     
