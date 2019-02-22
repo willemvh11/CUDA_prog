@@ -38,7 +38,7 @@ __device__ void rot( float *w, float *vec, const float dt)
 
 //-----------------------------------------------------------------------------
 
-__global__ void precessnucspins(float *i, float *a, float *s, const int ni, const float *dt)
+__global__ void precessnucspins(float *i, float *a, float *s, const int ni, const float dt)
 {
     extern __shared__ float iloc[];
     int ggid = (blockIdx.x * blockDim.x) + threadIdx.x;
@@ -63,7 +63,7 @@ __global__ void precessnucspins(float *i, float *a, float *s, const int ni, cons
         w[1] = store*s[1 + 3*ggid1];
         w[2] = store*s[2 + 3*ggid1];
 
-        rot (w, iloc+(3*glid+3*nl*glid1), dt[0]/2);
+        rot (w, iloc+(3*glid+3*nl*glid1), dt);
     }
     __syncthreads();
     int wind = 3*nl*groupid + glid;
@@ -102,11 +102,11 @@ __global__ void vecbuilds(float *s, float *sinit, curandState *state)
     sloc[3*glid + 1] = m*sin(th)*sin(phi);
     sloc[3*glid + 2] = m*cos(th);
     __syncthreads();
+    sinit[ggid] = sloc[3*glid + 2];
     int wind = 3*nl*groupid + glid;
     for(int ii = 0; ii < 3; ++ii, wind += nl)
     {
         s[wind] = sloc[glid + ii*nl];
-        sinit[wind] = sloc[glid + ii*nl];
     }
 }
 
@@ -224,7 +224,7 @@ const int ni, float *wout, const int count, const int size)
 //----------------------------------------------------------------------------- 
 
 __global__ void precesselecspins(float *w, float *wi, float *s, const int size, const int x, 
-float *sstore, const int a, const float *dt)
+float *sstore, const int a, const float dt)
 {
     extern __shared__ float locmem[];
     float* sloc = locmem;
@@ -243,13 +243,11 @@ float *sstore, const int a, const float *dt)
     wloc[3*glid] = w[3*a*ggid];
     wloc[3*glid + 1] = w[3*a*ggid + 1];
     wloc[3*glid + 2] = w[3*a*ggid + 2];
-    sstore[3*x + 3*size*ggid] = sloc[3*glid];
-    sstore[3*x + 1 + 3*size*ggid] = sloc[3*glid + 1];
-    sstore[3*x + 2 + 3*size*ggid] = sloc[3*glid + 2];
+    sstore[x + size*ggid] = sloc[3*glid + 2];
     wtemp[0] = wloc[3*glid] + wi[0];
     wtemp[1] = wloc[1 + 3*glid] + wi[1];
     wtemp[2] = wloc[2 + 3*glid] + wi[2];
-    rot (wtemp, sloc+(3*glid), dt[0]);
+    rot (wtemp, sloc+(3*glid), dt);
     __syncthreads();
     int wind = 3*nl*groupid + glid;
     for(int ii = 0; ii < 3; ++ii, wind += nl)
@@ -262,15 +260,13 @@ float *sstore, const int a, const float *dt)
 
 __global__ void prep2(float *sstore, float *output, const int size, float *sinit)
 {
-    extern __shared__ float locmem[];
-    float* loc = locmem;
+    extern __shared__ float loc[];
     int ggid = (blockIdx.x * blockDim.x) + threadIdx.x;
     int ggid1 = (blockIdx.y * blockDim.y) + threadIdx.y;
     int glid = threadIdx.x;
     int glid1 = threadIdx.y;
     int nl = blockDim.x;
     int ng = nl*gridDim.x;
-    int groupid = blockIdx.x;
     float store = sinit[ggid1];
     loc[glid + nl*glid1] = sstore[ggid + size*ggid1];
     loc[glid + nl*glid1] = loc[glid + nl*glid1]/store;
@@ -328,7 +324,7 @@ __global__ void tensors(float *output, float *Rzz, const int size, const int j)
      
      if (ggid < size) 
      {
-        Rzz[ggid + j*size] = Rzz[ggid + j*size] + output[3*ggid + 2];
+        Rzz[ggid + j*size] = Rzz[ggid + j*size] + output[ggid];
         
      }
      
@@ -404,19 +400,17 @@ int main(void)
     
     // Set up timestep
     
-    float *dt;
     
-    cudaMallocManaged(&dt, 1*sizeof(float));
     
-    dt[0] = 1.0;
+    float dt = 2.6279419040294205*20.0;
     
     // Set up maxtime
     
-    float tmax = 3000.0;
+    float tmax = 10000.0;
     
     // xmax - total number of timesteps
     
-    int xmax = tmax/dt[0];
+    int xmax = tmax/dt;
     
     // xmax must be a multiple of iterations
     
@@ -446,7 +440,7 @@ int main(void)
     
     // Set up monte carlo iterations
     
-    int mcs = 1;
+    int mcs = 5;
     
     // Set up 2D workgroups
     
@@ -457,7 +451,7 @@ int main(void)
     // Set up electron spin and initial electron spin arrays
     float *s, *sinit;
     cudaMallocManaged(&s, 3*global_size2*sizeof(float));
-    cudaMallocManaged(&sinit, 3*global_size2*sizeof(float));
+    cudaMallocManaged(&sinit, global_size2*sizeof(float));
     
     // Set up external field
     float *wi;
@@ -586,18 +580,13 @@ int main(void)
         // Build nuclear spin vector array
         vecbuildi<<<gridSize, blockSize, 3*local_size1*local_size2*sizeof(float)>>>(i, state, ni, nindium);
 
-        
+        precessnucspins<<<gridSize, blockSize, 3*local_size1*local_size2*sizeof(float)>>>(i, hyperfine, s, ni, dt/2.0);
         
         for (int j = 0; j < iterations; ++j)
         {
             
             for (int x = 0; x < size; ++x)
             {
-                // Precess the nuclear spins
-                precessnucspins<<<gridSize, blockSize, 3*local_size1*local_size2*sizeof(float)>>>(i, hyperfine, s, ni, dt);
-                
-                
-    
 
                 int p = 0;
                 int a = global_size1;
@@ -740,7 +729,7 @@ int main(void)
     for (int j = 0; j<xmax; ++j)
     {
         Rzztxt << time << " " << Rzz[j] << "\n";
-        time += dt[0];
+        time += dt;
         std::cout << time << " " << Rzz[j] << std::endl;
     }
     Rzztxt.close();
