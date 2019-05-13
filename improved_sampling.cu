@@ -36,41 +36,84 @@ __device__ void rot( float *w, float *vec, const float dt)
     vec[2] = i1[2] + i2[2]*cwt + i3[2]*swt;
 }
 
-//-----------------------------------------------------------------------------
+//----------------------------------------------------------------------------- 
 
-__global__ void precessnucspins(float *i, float *a, float *s, const int ni, const float dt)
+__global__ void precessnucspins (float *i, float *s, const int ni, float* hyp, float* wout, const int n, const int size, const float dt)
 {
     extern __shared__ float iloc[];
-    int ggid = (blockIdx.x * blockDim.x) + threadIdx.x;
-    int ggid1 = (blockIdx.y * blockDim.y) + threadIdx.y;
+
     int glid = threadIdx.x;
     int glid1 = threadIdx.y;
     int groupid = blockIdx.x;
     int nl = blockDim.x;
+    int nl1 = blockDim.y;
+    int ggid = (groupid * nl) + glid;
+    int ggid1 = (blockIdx.y * nl1) + glid1;
     float w[3];
-    float store = 0;
+    float hyperfine = 0;
+    int locsize = 3*nl*glid1;
+    int locid = 3*glid + locsize;
+    int globsize = 3*ni*ggid1;
     int sind = 3*nl*groupid + glid;
-    for(int ii = 0; ii < 3 && sind < 3*ni; ++ii, sind += nl)
+    for(int ii = 0; ii < 3; ++ii, sind += nl)
     {
-        iloc[glid + ii*nl + 3*nl*glid1] = i[sind + 3*ni*ggid1];
+        if (sind < 3*ni)
+        {
+            iloc[glid + ii*nl + locsize] = i[sind + globsize];
+        } else {
+            iloc[glid + ii*nl + locsize] = 0;
+        }
+        
     }
     __syncthreads();
     if (ggid < ni)
     {
-        store = a[ggid];
-     
-        w[0] = store*s[3*ggid1];
-        w[1] = store*s[1 + 3*ggid1];
-        w[2] = store*s[2 + 3*ggid1];
+// Idea! ADD CHECK IF GLID = 0 TO PREVENT MEMORY BANK CONFLICTS AND SAVE TO LOC MEM
+// OR   write to code to prevent strided mem access
+        hyperfine = hyp[ggid];
 
-        rot (w, iloc+(3*glid+3*nl*glid1), dt);
+        w[0] = hyperfine*s[3*ggid1];
+        w[1] = hyperfine*s[1 + 3*ggid1];
+        w[2] = hyperfine*s[2 + 3*ggid1];
+
+        rot (w, iloc+(locid), dt);
+        
+        
+        
     }
     __syncthreads();
     int wind = 3*nl*groupid + glid;
     for(int ii = 0; ii < 3 && wind < 3*ni; ++ii, wind += nl)
     {
-        i[wind + 3*ni*ggid1] = iloc[glid + 3*nl*glid1 + ii*nl];
+        i[wind + globsize] = iloc[glid + locsize + ii*nl];
     }
+    __syncthreads();
+
+    iloc[locid] = hyperfine*iloc[locid];
+    iloc[locid + 1] = hyperfine*iloc[locid + 1];
+    iloc[locid + 2] = hyperfine*iloc[locid + 2];
+
+    #pragma unroll
+    for (int k=1; k < n; k++)
+    {
+        __syncthreads();
+        int b = nl >> k;
+        if (glid < b) 
+        {
+            iloc[locid] += iloc[3*(glid + b)+ locsize];
+            iloc[locid + 1] += iloc[3*(glid + b) + 1+ locsize];
+            iloc[locid + 2] += iloc[3*(glid + b) + 2+ locsize];
+        }
+    }
+    __syncthreads();
+    
+    if (glid == 0) 
+    {
+        wout[(ggid >> n)*3 + 3*size*ggid1] = iloc[locsize] + iloc[3 + locsize];
+        wout[(ggid >> n)*3 + 1 + 3*size*ggid1] = iloc[1 + locsize] + iloc[4 + locsize];
+        wout[(ggid >> n)*3 + 2 + 3*size*ggid1] = iloc[2 + locsize] + iloc[5 + locsize];
+    }    
+    
 }
 
 
@@ -86,7 +129,9 @@ __global__ void setup_rand(curandState *state, unsigned long seed, const int mcs
 
 //----------------------------------------------------------------------------- 
 
-__global__ void vecbuilds(float *s, float *sinit, curandState *state)
+//----------------------------------------------------------------------------- 
+
+__global__ void vecbuilds(float *s, float *sinit, curandState *state, const float len)
 {
     extern __shared__ float sloc[];
     int ggid = (blockIdx.x * blockDim.x) + threadIdx.x;
@@ -95,12 +140,11 @@ __global__ void vecbuilds(float *s, float *sinit, curandState *state)
     int groupid = blockIdx.x;
     float v = curand_uniform(&state[ggid]);
     float g = curand_uniform(&state[ggid]);
-    float m = sqrt(3.0f/4.0f);
     float phi = 2.0*M_PI*v;
     float th = acos(cbrtf(2.0*g - 1.0));
-    sloc[3*glid] = m*sin(th)*cos(phi);
-    sloc[3*glid + 1] = m*sin(th)*sin(phi);
-    sloc[3*glid + 2] = m*cos(th);
+    sloc[3*glid] = len*sin(th)*cos(phi);
+    sloc[3*glid + 1] = len*sin(th)*sin(phi);
+    sloc[3*glid + 2] = len*cos(th);
     __syncthreads();
     sinit[ggid] = sloc[3*glid + 2];
     int wind = 3*nl*groupid + glid;
@@ -145,41 +189,26 @@ __global__ void vecbuildi(float *i, curandState *state, const int ni, const int 
 
 //----------------------------------------------------------------------------- 
 
-__global__ void reduce(float *i, float *w, const int n, const int a, float *hyp, 
-const int ni, float *wout, const int count, const int size)
+__global__ void reduce(float *w, const int n, const int a, float *wout, const int size)
 {
-    extern __shared__ float locmem[];
-    float* store = locmem;
-    float* wtemp = store + blockDim.x;
-    int ggid = (blockIdx.x * blockDim.x) + threadIdx.x;
-    int ggid1 = (blockIdx.y * blockDim.y) + threadIdx.y;
+    extern __shared__ float wtemp[];
+    int nl = blockDim.x;
+    int groupid = blockIdx.x;
     int glid = threadIdx.x;
     int glid1 = threadIdx.y;
-    int nl = blockDim.x;
+    int ggid = (groupid * nl) + glid;
+    int ggid1 = (blockIdx.y * blockDim.y) + glid1;
     int ng = nl*gridDim.x;
-    int groupid = blockIdx.x;
-    if (count == 0) 
-    {
-        if (ggid < ni)
-        {
-            store[glid] = hyp[ggid];
-        }
-        int sind = 3*nl*groupid + glid;
-        for(int ii = 0; ii < 3 && sind < 3*ni; ++ii, sind += nl)
-        {
-            w[sind + 3*ng*ggid1] = i[sind + 3*ni*ggid1];
-        }
-        __syncthreads();
+    int locsize = 3*nl*glid1;
+    int globsize = 3*ng*ggid1;
+    int id = 3*glid + locsize;
 
-        wtemp[glid + 3*nl*glid1] = store[(glid - glid%3)/3]*w[3*nl*groupid + glid + 3*ng*ggid1];
-        wtemp[glid + nl + 3*nl*glid1] = store[(glid + nl - (glid + nl)%3)/3]*w[3*nl*groupid + glid + nl + 3*ng*ggid1];
-        wtemp[glid + 2*nl + 3*nl*glid1] = store[(glid + 2*nl - (glid + 2*nl)%3)/3]*w[3*nl*groupid + glid + 2*nl + 3*ng*ggid1];
+    int wind = 3*nl*groupid + glid;
     
-    } else {
-        wtemp[glid + 3*nl*glid1] = w[3*nl*groupid + glid + 3*ng*ggid1];
-        wtemp[glid + nl + 3*nl*glid1] = w[3*nl*groupid + glid + nl + 3*ng*ggid1];
-        wtemp[glid + 2*nl + 3*nl*glid1] = w[3*nl*groupid + glid + 2*nl + 3*ng*ggid1];
-    }
+    wtemp[glid + locsize] = w[wind + globsize];
+    wtemp[glid + nl + locsize] = w[wind + nl + globsize];
+    wtemp[glid + 2*nl + locsize] = w[wind + 2*nl + globsize];
+    
     #pragma unroll
     for (int k=1; k < n; k++)
     {
@@ -187,31 +216,24 @@ const int ni, float *wout, const int count, const int size)
         int b = nl >> k;
         if (glid < b) 
         {
-            wtemp[3*glid + 3*nl*glid1] += wtemp[3*(glid + b)+ 3*nl*glid1];
-            wtemp[3*glid + 1 + 3*nl*glid1] += wtemp[3*(glid + b) + 1+ 3*nl*glid1];
-            wtemp[3*glid + 2 + 3*nl*glid1] += wtemp[3*(glid + b) + 2+ 3*nl*glid1];
+            wtemp[id] += wtemp[3*(glid + b)+ locsize];
+            wtemp[id + 1] += wtemp[3*(glid + b) + 1+ locsize];
+            wtemp[id + 2] += wtemp[3*(glid + b) + 2+ locsize];
         }
     }
     __syncthreads();
     
     if (glid == 0) 
     {
-        wout[(ggid >> n)*3 + 3*size*ggid1] = wtemp[3*nl*glid1] + wtemp[3 + 3*nl*glid1];
-        wout[(ggid >> n)*3 + 1 + 3*size*ggid1] = wtemp[1 + 3*nl*glid1] + wtemp[4 + 3*nl*glid1];
-        wout[(ggid >> n)*3 + 2 + 3*size*ggid1] = wtemp[2 + 3*nl*glid1] + wtemp[5 + 3*nl*glid1];
+        wout[(ggid >> n)*3 + 3*size*ggid1] = wtemp[locsize] + wtemp[3 + locsize];
+        wout[(ggid >> n)*3 + 1 + 3*size*ggid1] = wtemp[1 + locsize] + wtemp[4 + locsize];
+        wout[(ggid >> n)*3 + 2 + 3*size*ggid1] = wtemp[2 + locsize] + wtemp[5 + locsize];
     }    
-    int c = 0;
-    if (a%nl == 0)
-    {
-        c = a/nl;
-    }
-    else
-    {
-        c = a/nl + 1;
-    }
+    int c = (a + nl - 1)/nl;
+    
     __syncthreads();
     
-    int wind = 3*nl*groupid + glid;
+    
     for(int ii = 0; ii < 3 && wind < 3*size; ++ii, wind += nl)
     {
         if (wind >= 3*c)
@@ -226,9 +248,7 @@ const int ni, float *wout, const int count, const int size)
 __global__ void precesselecspins(float *w, float *wi, float *s, const int size, const int x, 
 float *sstore, const int a, const float dt)
 {
-    extern __shared__ float locmem[];
-    float* sloc = locmem;
-    float* wloc = sloc + 3*blockDim.x;
+    extern __shared__ float sloc[];
     float wtemp[3];
     int ggid = (blockIdx.x * blockDim.x) + threadIdx.x;
     int glid = threadIdx.x;
@@ -240,13 +260,13 @@ float *sstore, const int a, const float dt)
         sloc[glid + ii*nl] = s[sind];
     }
     __syncthreads();
-    wloc[3*glid] = w[3*a*ggid];
-    wloc[3*glid + 1] = w[3*a*ggid + 1];
-    wloc[3*glid + 2] = w[3*a*ggid + 2];
+    wtemp[0] = w[3*a*ggid];
+    wtemp[1] = w[3*a*ggid + 1];
+    wtemp[2] = w[3*a*ggid + 2];
     sstore[x + size*ggid] = sloc[3*glid + 2];
-    wtemp[0] = wloc[3*glid] + wi[0];
-    wtemp[1] = wloc[1 + 3*glid] + wi[1];
-    wtemp[2] = wloc[2 + 3*glid] + wi[2];
+    wtemp[0] = wtemp[0] + wi[0];
+    wtemp[1] = wtemp[1] + wi[1];
+    wtemp[2] = wtemp[2] + wi[2];
     rot (wtemp, sloc+(3*glid), dt);
     __syncthreads();
     int wind = 3*nl*groupid + glid;
@@ -267,10 +287,12 @@ __global__ void prep2(float *sstore, float *output, const int size, float *sinit
     int glid1 = threadIdx.y;
     int nl = blockDim.x;
     int ng = nl*gridDim.x;
-    float store = sinit[ggid1];
-    loc[glid + nl*glid1] = sstore[ggid + size*ggid1];
-    loc[glid + nl*glid1] = loc[glid + nl*glid1]/store;
-    output[ggid + ng*ggid1] = loc[glid + nl*glid1];
+    if (ggid < size)
+    {
+        loc[glid + nl*glid1] = sstore[ggid + size*ggid1];
+        loc[glid + nl*glid1] = loc[glid + nl*glid1]/sinit[ggid1];
+    }
+    output[ggid + ng*ggid1] = (1.0/2.0)*loc[glid + nl*glid1];
 } 
 
 //-----------------------------------------------------------------------------
@@ -318,13 +340,13 @@ __global__ void reduce2(const int n, const int a, float *output, float *out)
 
 //-----------------------------------------------------------------------------
 
-__global__ void tensors(float *output, float *Rzz, const int size, const int j)
+__global__ void tensors(float *output, float *Rzz, const int size, const int j, const float recipmcs)
 {
      int ggid = (blockIdx.x * blockDim.x) + threadIdx.x;
      
      if (ggid < size) 
      {
-        Rzz[ggid + j*size] = Rzz[ggid + j*size] + output[ggid];
+        Rzz[ggid + j*size] = Rzz[ggid + j*size] + output[ggid]*recipmcs;
         
      }
      
@@ -332,25 +354,23 @@ __global__ void tensors(float *output, float *Rzz, const int size, const int j)
 
 //-----------------------------------------------------------------------------
 
-__global__ void final(float *Rzz, const int mcs, const int xmax)
+__global__ void final(float *Rzz, const float recipmcs, const int xmax)
 {
     int ggid = (blockIdx.x * blockDim.x) + threadIdx.x;
-    float recipmcs = 1.0f/mcs;
     if (ggid < xmax)
     {
-        Rzz[ggid] = (1.0/2.0)*Rzz[ggid]*recipmcs;
+        Rzz[ggid] = Rzz[ggid]*recipmcs;
     }
 }
 
 //-----------------------------------------------------------------------------
 
-__global__ void final_temp(float *Rzz, const int mcs, const int xmax, float *Rzztemp)
+__global__ void final_temp(float *Rzz, const float recipmcs, const int xmax, float *Rzztemp)
 {
     int ggid = (blockIdx.x * blockDim.x) + threadIdx.x;
-    float recipmcs = 1.0f/mcs;
     if (ggid < xmax)
     {
-        Rzztemp[ggid] = (1.0/2.0)*Rzz[ggid]*recipmcs;
+        Rzztemp[ggid] = Rzz[ggid]*recipmcs;
     }
 }
 
@@ -360,11 +380,12 @@ __global__ void final_temp(float *Rzz, const int mcs, const int xmax, float *Rzz
 int main(void)
 {
 
+    // Code only works if ni <= local_size1**2 - haven't had time to figure out why
+
     int nDevices;
 
     clock_t t;
     
-
     t = clock();
 
     cudaGetDeviceCount(&nDevices);
@@ -381,11 +402,11 @@ int main(void)
                2.0*prop.memoryClockRate*(prop.memoryBusWidth/8)/1.0e6);
     }
 
-    int ni = 1160;
+    int ni = 100;
     
-    int nindium = 553;
-    
-    
+    int nindium = 50;
+
+    float len = sqrt(5.0/12.0);
     
     int local_size1 = 32;
     int local_size2 = 32;
@@ -400,21 +421,21 @@ int main(void)
     
     // Set up timestep
     
+    float dt = 65.162413696574831;
     
     
-    float dt = 2.6279419040294205*20.0;
     
     // Set up maxtime
     
-    float tmax = 10000.0;
+    //float tmax = 30000000.0;
     
     // xmax - total number of timesteps
     
-    int xmax = tmax/dt;
+    int xmax = 1000;
     
     // xmax must be a multiple of iterations
     
-    int iterations = 1;
+    int iterations = xmax/1000;
     
     int size = xmax/iterations;
     
@@ -434,13 +455,22 @@ int main(void)
 
     dim3 gridSizeodd = dim3 (global_blocks_odd, global_blocks2);
 
+    // Global size for 3rd reduction
+
+    
+    int global_blocks_red = (global_blocks_odd + local_size1 - 1)/local_size1;;
+
+    int global_size_red = global_blocks_red*local_size1;
+
+    dim3 gridSizered = dim3 (global_blocks_red, global_blocks2);
+
     // Global size for final step
 
     int global_blocks_final = (xmax + local_size1 - 1)/local_size1;
     
     // Set up monte carlo iterations
     
-    int mcs = 5;
+    int mcs = 1;
     
     // Set up 2D workgroups
     
@@ -493,7 +523,7 @@ int main(void)
         p += 1;
     }
     
-    
+
     
     
     /*
@@ -561,18 +591,20 @@ int main(void)
 
     float time = 0;
         
-    //----------------------------------------------------------------------------- 
     // Kernel Calls
     
     // Call random number generation setup kernel
     setup_rand<<<global_blocks1*global_blocks2, local_size1*local_size2>>>(state,seed,mcs);
+
+
+    
     
     for (int u = 0; u < mcs; ++u)
     {
         
         
         // Build electron spin vectors array
-        vecbuilds<<<global_blocks2, local_size2, 3*local_size2*sizeof(float)>>>(s, sinit, state);
+        vecbuilds<<<global_blocks2, local_size2, 3*local_size2*sizeof(float)>>>(s, sinit, state, len);
         
         
         
@@ -580,32 +612,30 @@ int main(void)
         // Build nuclear spin vector array
         vecbuildi<<<gridSize, blockSize, 3*local_size1*local_size2*sizeof(float)>>>(i, state, ni, nindium);
 
-        precessnucspins<<<gridSize, blockSize, 3*local_size1*local_size2*sizeof(float)>>>(i, hyperfine, s, ni, dt/2.0);
+        // Precess the nuclear spins by dt/2 initially
+
+        precessnucspins<<<gridSize, blockSize, 3*local_size1*local_size2*sizeof(float)>>>(i, s, ni, hyperfine, wout, n1, global_size_odd, dt/2.0);
         
         for (int j = 0; j < iterations; ++j)
         {
             
             for (int x = 0; x < size; ++x)
             {
-
+            
                 int p = 0;
-                int a = global_size1;
+                int a = global_blocks1;
+                
                 
                 while (a>1)
                 {
-                    if (p%2 == 0)
+                    if (p%2 != 0)
                     {
-                        reduce<<<gridSize, blockSize, (local_size1 + 3*local_size1*local_size2)*sizeof(float)>>>(i, w, n1, a, hyperfine, ni, wout, p, global_size_odd);
+                        reduce<<<gridSizered, blockSize, 3*local_size1*local_size2*sizeof(float)>>>(w, n1, a, wout, global_size_odd);
                     } else{
-                        reduce<<<gridSizeodd, blockSize, (local_size1 + 3*local_size1*local_size2)*sizeof(float)>>>(i, wout, n1, a, hyperfine, ni, w, p, global_size1);
+                        reduce<<<gridSizeodd, blockSize, 3*local_size1*local_size2*sizeof(float)>>>(wout, n1, a, w, global_size_red);
                     }
                     
-                    if (a%local_size1 == 0)
-                    {
-                        a = a/local_size1;
-                    } else {
-                        a = a/local_size1 + 1;
-                    }
+                    a = (a + local_size1 - 1)/local_size1;
                     p = p + 1;
                 }
                 pmax = p;
@@ -614,15 +644,15 @@ int main(void)
 
 
                 
-                if (pmax%2 == 0)
+                if (pmax%2 != 0)
                 {
-                    precesselecspins<<<global_blocks2,local_size2,2*3*local_size2*sizeof(float)>>>(w, wi, s, size, x, sstore, global_size1, dt);
+                    precesselecspins<<<global_blocks2,local_size2,3*local_size2*sizeof(float)>>>(w, wi, s, size, x, sstore, global_size_red, dt);
                 } else {
-                    precesselecspins<<<global_blocks2,local_size2,2*3*local_size2*sizeof(float)>>>(wout, wi, s, size, x, sstore, global_size_odd, dt);
+                    precesselecspins<<<global_blocks2,local_size2,3*local_size2*sizeof(float)>>>(wout, wi, s, size, x, sstore, global_size_odd, dt);
                 }
                 
                 
-                precessnucspins<<<gridSize, blockSize, 3*local_size1*local_size2*sizeof(float)>>>(i, hyperfine, s, ni, dt);
+                precessnucspins<<<gridSize, blockSize, 3*local_size1*local_size2*sizeof(float)>>>(i, s, ni, hyperfine, wout, n1, global_size_odd, dt);
             }
             
             // Prepare sstore for Rxx, Rxy, Rzz calculation
@@ -644,14 +674,7 @@ int main(void)
                     reduce2<<<gridSizetensors, blockSize, local_size1*local_size2*sizeof(float)>>>(n2, b, out, output);
                 }
                 
-                if (b%local_size2 == 0)
-                {
-                    b = b/local_size2;
-                }
-                else
-                {
-                    b = b/local_size2 + 1;
-                }
+                b = (b + local_size2 - 1)/local_size2;
                 g = g + 1;
             }
             
@@ -659,56 +682,38 @@ int main(void)
             // now a 1D workgroup size
             if (g%2 ==0)
             {
-                tensors<<<global_blocks_tensors, local_size1>>>(output, Rzz, size, j);
+                tensors<<<global_blocks_tensors, local_size1>>>(output, Rzz, size, j, 1.0/global_size2);
             } else {
-                tensors<<<global_blocks_tensors, local_size1>>>(out, Rzz, size, j);
+                tensors<<<global_blocks_tensors, local_size1>>>(out, Rzz, size, j, 1.0/global_size2);
             }
             
         }
         /*
-        if (u%5 == 0 && u != 0)
+        int o = 0;
+        if (u != (mcs-1))
         {
-            final_temp<<<global_blocks_final, local_size1>>>(Rxx, Rxy, Rzz, u*global_size2, xmax, Rxxtemp, Rxytemp, Rzztemp);
+            final_temp<<<global_blocks_final, local_size1>>>(Rzz, (u+1)*global_size2, xmax, Rzztemp);
             cudaDeviceSynchronize();
-            if (u%2 == 0)
+            
+            std::ofstream Rzztemp2txt;
+    
+            Rzztemp2txt.open("Rzz_w=0_10071_temp1.txt");
+            
+            time = 0;
+            
+            for (int j = 0; j<xmax; ++j)
             {
-                std::ofstream Rzztemp2txt;
-        
-                Rzztemp2txt.open("Rzz_w=0_93_temp2_1.txt");
-                
-                time = 0;
-                
-                for (int j = 0; j<xmax; ++j)
-                {
-                    Rzztemp2txt << time << " " << Rzztemp[j] << "\n";
-                    time += dt[0];
-                }
-                Rzztemp2txt.close();
-            } else {
-
-                std::ofstream Rzztemp1txt;
-        
-                Rzztemp1txt.open("Rzz_w=0_93_temp1_1.txt");
-                
-                time = 0;
-                
-                for (int j = 0; j<xmax; ++j)
-                {
-                    Rzztemp1txt << time << " " << Rzztemp[j] << "\n";
-                    time += dt[0];
-                }
-                Rzztemp1txt.close();
+                Rzztemp2txt << time << " " << Rzztemp[j] << "\n";
+                time += dt;
             }
+            Rzztemp2txt.close();
         }
         */
-        
     }
     
-    int h = mcs*global_size2;
     
     
-    
-    final<<<global_blocks_final, local_size1>>>(Rzz, h, xmax);
+    final<<<global_blocks_final, local_size1>>>(Rzz, 1.0/mcs, xmax);
     
     cudaDeviceSynchronize();
 
@@ -722,16 +727,72 @@ int main(void)
     
     std::ofstream Rzztxt;
     
-    Rzztxt.open("Rzz_w=0_improved.txt");
+    Rzztxt.open("root512_100_spins_1.txt");
+
+    for (int j = 0; j<xmax; ++j)
+    {
+        Rzztxt << j << " " << Rzz[j] << "\n";
+        //std::cout << time << " " << Rzz[j] << std::endl;
+        time += dt;
+    }
+    Rzztxt.close();
     
+    /*
     time = 0;
+
+    float sum = 0;
     
     for (int j = 0; j<xmax; ++j)
     {
-        Rzztxt << time << " " << Rzz[j] << "\n";
-        time += dt;
-        std::cout << time << " " << Rzz[j] << std::endl;
+        
+        if (j <= 1000)
+        {
+            Rzztxt << j << " " << Rzz[j] << "\n";
+        }
+
+        else if (j <= 10000)
+        {
+            sum = sum + Rzz[j];
+            if (j%10 == 0)
+            {
+                Rzztxt << j - 5 << " " << sum/10.0 << "\n";
+                sum = 0;
+            }
+        }
+
+        else if (j <= 100000)
+        {
+            sum = sum + Rzz[j];
+            if (j%100 == 0)
+            {
+                Rzztxt << j - 50 << " " << sum/100.0 << "\n";
+                sum = 0;
+            }
+        }
+        else if (j <= 1000000)
+        {
+            if (j%1000 == 0)
+            {
+                Rzztxt << j << " " << Rzz[j] << "\n";
+            }
+        }
+        else if (j <= 10000000)
+        {
+            if (j%10000 == 0)
+            {
+                Rzztxt << j << " " << Rzz[j] << "\n";
+            }
+        }
+        else if (j <= 100000000)
+        {
+            if (j%100000 == 0)
+            {
+                Rzztxt << j << " " << Rzz[j] << "\n";
+            }
+        }
     }
+
+    */
     Rzztxt.close();
     
     
@@ -748,10 +809,12 @@ int main(void)
     cudaFree(out);
     cudaFree(wout);
     cudaFree(Rzztemp);
+    
     return 0;
     
     
     
 }
+
 
 
